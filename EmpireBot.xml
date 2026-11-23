@@ -90,7 +90,7 @@
    </window>
 
    <!-- ===================== Game settings ===================== -->
-   <window id="setwin" title="Game Settings" open="false">
+   <window id="setwin" title="Game Settings" width="520" height="640" open="false">
       <vgroup>
          <vgroup frame="true" frametitle="Server">
             <colgroup columns="2">
@@ -140,7 +140,7 @@
    </window>
 
    <!-- ===================== About ===================== -->
-   <window id="aboutwin" title="About EmpireBot" open="false">
+   <window id="aboutwin" title="About EmpireBot" width="360" height="240" open="false">
       <vgroup>
          <label id="abouttitle">EmpireBot</label>
          <label id="aboutver">Version</label>
