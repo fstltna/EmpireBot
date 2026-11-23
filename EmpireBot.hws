@@ -362,6 +362,14 @@ Function p_CloseGame(ask)
    Return(True)
 EndFunction
 
+; open a window at a fixed size; GTK may ignore XML sizes of windows
+; that start hidden, so set them again right before opening
+Function p_OpenWindow(id$, w, h)
+   moai.Set(id$, "width", w)
+   moai.Set(id$, "height", h)
+   moai.Set(id$, "open", True)
+EndFunction
+
 /* ------------------------------------------------------------------
 ** Settings window
 ** ------------------------------------------------------------------ */
@@ -382,7 +390,7 @@ Function p_ShowSettings()
    moai.Set("setpercmds", "text", gm.percmds)
    moai.Set("setautopoll", "selected", gm.autopoll)
    moai.Set("setwarn", "selected", gm.warn)
-   moai.Set("setwin", "open", True)
+   p_OpenWindow("setwin", 520, 640)
 EndFunction
 
 Function p_ApplySettings()
@@ -1116,8 +1124,7 @@ Function p_InitHelp()
    t$ = t$ .. "  and is retried at the next interval.\n"
    t$ = t$ .. "  Game files store the password in plain text.\n"
    moai.DoMethod("helptext", "Insert", t$, "Top")
-   moai.Set("abouttitle", "text", #APPNAME)
-   moai.Set("aboutver", "text", "Version " .. #APPVER)
+   moai.Set("abouttext", "text", #APPNAME .. " " .. #APPVER .. "\n\nA bot player for Wolfpack Empire\nWritten in Hollywood with RapaGUI\nCompanion to GtkACE")
 EndFunction
 
 /* ------------------------------------------------------------------
@@ -1157,9 +1164,9 @@ Function p_MenuSelected(id$)
    Case "msettings":
       p_ShowSettings()
    Case "mhelp":
-      moai.Set("helpwin", "open", True)
+      p_OpenWindow("helpwin", 560, 480)
    Case "mabout":
-      moai.Set("aboutwin", "open", True)
+      p_OpenWindow("aboutwin", 380, 260)
    EndSwitch
 EndFunction
 

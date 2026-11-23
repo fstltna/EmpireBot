@@ -124,7 +124,9 @@
             <checkbox id="setautopoll">Poll the server automatically</checkbox>
             <checkbox id="setwarn">Bot warnings (starving sectors, idle ships)</checkbox>
          </vgroup>
+         <rectangle/>
          <hgroup>
+            <rectangle/>
             <button id="setok">OK</button>
             <button id="setcancel">Cancel</button>
          </hgroup>
@@ -140,14 +142,20 @@
    </window>
 
    <!-- ===================== About ===================== -->
-   <window id="aboutwin" title="About EmpireBot" width="360" height="240" open="false">
+   <window id="aboutwin" title="About EmpireBot" width="380" height="260" open="false">
       <vgroup>
-         <label id="abouttitle">EmpireBot</label>
-         <label id="aboutver">Version</label>
-         <label>A bot player for Wolfpack Empire</label>
-         <label>Written in Hollywood with RapaGUI</label>
-         <label>Companion to GtkACE</label>
-         <button id="aboutok">OK</button>
+         <rectangle/>
+         <hgroup>
+            <rectangle/>
+            <text id="abouttext">EmpireBot</text>
+            <rectangle/>
+         </hgroup>
+         <rectangle/>
+         <hgroup>
+            <rectangle/>
+            <button id="aboutok">OK</button>
+            <rectangle/>
+         </hgroup>
       </vgroup>
    </window>
 
