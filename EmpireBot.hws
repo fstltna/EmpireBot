@@ -680,10 +680,13 @@ Function p_OnNetData(msg)
 
    Local chunk$ = ""
    Local closed = False
+   Local done = False
+   Local d$ = ""
+   Local cnt = 0
    ExitOnError(False)
    GetLastError()
    Repeat
-      Local d$, cnt, done = ReceiveData(g.conn, #RECEIVEALL, False)
+      d$, cnt, done = ReceiveData(g.conn, #RECEIVEALL, False)
       If GetLastError() <> 0
          closed = True
          Break
@@ -889,7 +892,8 @@ EndFunction
 Function p_RefreshViews()
    ; map bounds
    Local first = True
-   For Local k, c In Pairs(g.map)
+   Local k, c = NextItem(g.map)
+   While GetType(k) <> #NIL
       If first
          g.minx = c.x
          g.maxx = c.x
@@ -902,7 +906,8 @@ Function p_RefreshViews()
          g.miny = Min(g.miny, c.y)
          g.maxy = Max(g.maxy, c.y)
       EndIf
-   Next
+      k, c = NextItem(g.map, k)
+   Wend
    If first
       g.minx = 0
       g.maxx = -1
