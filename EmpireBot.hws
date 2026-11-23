@@ -637,7 +637,7 @@ Function p_HandleLine(line$)
       If g.state = "cmd" And FindStr(text$, "is not a legal command") > -1
          If GetType(g.cur) = #TABLE
             If g.cur.src = "info"
-               p_Out("*** Your country can't use '" .. g.cur.cmd .. "'. Queue 'nation' to check its status - visitor and not-yet-started countries can't get maps or dumps.")
+               p_Out("*** Your country can't use '" .. g.cur.cmd .. "'. Queue 'nation' to check its status - countries still in sanctuary (or visitors) can't get maps or dumps - break sanctuary first.")
             EndIf
          EndIf
       EndIf
