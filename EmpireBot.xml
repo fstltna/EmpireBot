@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   EmpireBot - RapaGUI interface definition
+   Loaded by EmpireBot.hws via moai.CreateApp()
+-->
+<application id="app">
+
+   <!-- ===================== Menus ===================== -->
+   <menubar id="mainmenu">
+      <menu title="_File">
+         <item id="mnew" shortcut="Ctrl+N">_New...</item>
+         <item id="mopen" shortcut="Ctrl+O">_Open...</item>
+         <item id="mclose" shortcut="Ctrl+W">_Close</item>
+         <item/>
+         <item id="msave" shortcut="Ctrl+S">_Save</item>
+         <item/>
+         <item id="mquit" shortcut="Ctrl+Q">_Quit</item>
+      </menu>
+      <menu title="_Actions">
+         <item id="mpoll" shortcut="Ctrl+P">_Poll server now</item>
+         <item id="mdisconnect">_Disconnect</item>
+         <item/>
+         <item id="mclearq">C_lear command queue</item>
+      </menu>
+      <menu title="_Settings">
+         <item id="msettings" shortcut="Ctrl+E">_Game settings...</item>
+      </menu>
+      <menu title="_Help">
+         <item id="mhelp" shortcut="F1">_Help...</item>
+         <item/>
+         <item id="mabout">_About EmpireBot...</item>
+      </menu>
+   </menubar>
+
+   <!-- ===================== Main window ===================== -->
+   <window id="mainwin" title="EmpireBot" menubar="mainmenu" width="960" height="720" notify="closerequest">
+      <vgroup>
+         <pageview id="pages">
+            <vgroup title="Map">
+               <scrollcanvas id="map" virtwidth="640" virtheight="400" notify="paint"/>
+               <label id="maplegend">No map yet - poll the server to fetch one.</label>
+            </vgroup>
+            <vgroup title="Ships">
+               <listview id="shiplist" notify="active">
+                  <column title="ID"/>
+                  <column title="Type"/>
+                  <column title="X"/>
+                  <column title="Y"/>
+                  <column title="Fleet"/>
+                  <column title="Eff"/>
+                  <column title="Mob"/>
+                  <column title="Mil"/>
+                  <column title="Food"/>
+                  <column title="Tech"/>
+               </listview>
+            </vgroup>
+            <vgroup title="Sectors">
+               <listview id="sectlist">
+                  <column title="X"/>
+                  <column title="Y"/>
+                  <column title="Des"/>
+                  <column title="Eff"/>
+                  <column title="Mob"/>
+                  <column title="Civ"/>
+                  <column title="Mil"/>
+                  <column title="Food"/>
+                  <column title="Work"/>
+               </listview>
+            </vgroup>
+         </pageview>
+
+         <vgroup frame="true" frametitle="Server output">
+            <texteditor id="output" readonly="true"/>
+         </vgroup>
+
+         <hgroup>
+            <label>Command:</label>
+            <textentry id="cmdentry" notify="acknowledge"/>
+            <button id="btnqueue">Queue</button>
+            <button id="btnpoll">Poll now</button>
+            <button id="btnclearq">Clear queue</button>
+         </hgroup>
+
+         <statusbar>
+            <item id="sbonline" width="30">Offline</item>
+            <item id="sbqcount" width="12">Queued: 0</item>
+            <item id="sbqueue">Queue: (empty)</item>
+         </statusbar>
+      </vgroup>
+   </window>
+
+   <!-- ===================== Game settings ===================== -->
+   <window id="setwin" title="Game Settings" open="false">
+      <vgroup>
+         <vgroup frame="true" frametitle="Server">
+            <colgroup columns="2">
+               <label>Game name:</label>
+               <textentry id="setname"/>
+               <label>Host:</label>
+               <textentry id="sethost"/>
+               <label>Port:</label>
+               <textentry id="setport"/>
+            </colgroup>
+         </vgroup>
+         <vgroup frame="true" frametitle="Login">
+            <colgroup columns="2">
+               <label>Player name:</label>
+               <textentry id="setuser"/>
+               <label>Country:</label>
+               <textentry id="setcountry"/>
+               <label>Password:</label>
+               <textentry id="setpass" password="true"/>
+            </colgroup>
+         </vgroup>
+         <vgroup frame="true" frametitle="Polling">
+            <colgroup columns="2">
+               <label>Poll every (minutes):</label>
+               <textentry id="setinterval"/>
+               <label>Map area:</label>
+               <textentry id="setmaparea"/>
+               <label>Commands each poll:</label>
+               <textentry id="setpercmds"/>
+            </colgroup>
+            <checkbox id="setautopoll">Poll the server automatically</checkbox>
+            <checkbox id="setwarn">Bot warnings (starving sectors, idle ships)</checkbox>
+         </vgroup>
+         <hgroup>
+            <button id="setok">OK</button>
+            <button id="setcancel">Cancel</button>
+         </hgroup>
+      </vgroup>
+   </window>
+
+   <!-- ===================== Help ===================== -->
+   <window id="helpwin" title="EmpireBot Help" width="560" height="480" open="false">
+      <vgroup>
+         <texteditor id="helptext" readonly="true"/>
+         <button id="helpclose">Close</button>
+      </vgroup>
+   </window>
+
+   <!-- ===================== About ===================== -->
+   <window id="aboutwin" title="About EmpireBot" open="false">
+      <vgroup>
+         <label id="abouttitle">EmpireBot</label>
+         <label id="aboutver">Version</label>
+         <label>A bot player for Wolfpack Empire</label>
+         <label>Written in Hollywood with RapaGUI</label>
+         <label>Companion to GtkACE</label>
+         <button id="aboutok">OK</button>
+      </vgroup>
+   </window>
+
+</application>

@@ -1,0 +1,1190 @@
+/*
+** EmpireBot - a bot player for Wolfpack Empire
+** Hollywood 9+ / RapaGUI 2+
+**
+** The bot connects to an Empire server on a timer, logs in, runs the
+** per-poll commands and your queued commands, fetches a map (bmap),
+** a sector dump (dump *) and a ship dump (sdump *), updates the
+** displays and logs out again so it never blocks a human player.
+**
+** Strategy hooks live in p_BotThink() - that is where to teach the
+** bot to actually play.
+*/
+
+@VERSION 9,0
+@REQUIRE "RapaGUI"
+@APPTITLE "EmpireBot"
+@APPVERSION "$VER: EmpireBot 1.0.0 (23.11.26)"
+@APPCOPYRIGHT "(C) 2026"
+@APPDESCRIPTION "Bot player for Wolfpack Empire"
+@DISPLAY {Hidden = True}
+
+Const #APPNAME = "EmpireBot"
+Const #APPVER  = "1.0.0"
+
+; map cell geometry (pixels)
+Const #CELLW   = 12
+Const #CELLH   = 16
+Const #MARGINL = 36
+Const #MARGINT = 20
+
+; seconds of silence before we give up on a session
+Const #NETTIMEOUT = 90
+
+/* ------------------------------------------------------------------
+** Global state
+** ------------------------------------------------------------------ */
+g = {}
+g.game      = Nil     ; current game settings table (Nil = no game open)
+g.filename  = ""      ; file the game was loaded from / saved to
+g.dirty     = False   ; unsaved changes
+g.conn      = Nil     ; network connection handle
+g.state     = "offline"
+g.rxbuf     = ""      ; partial line buffer
+g.outbuf    = ""      ; text waiting to go to the output widget
+g.session   = {}      ; commands still to send this session
+g.cur       = Nil     ; command currently running {cmd=, src=}
+g.cmdout    = {}      ; data lines produced by g.cur
+g.thought   = False   ; p_BotThink() already ran this session
+g.flushes   = 0       ; sub-prompts answered for the current command
+g.clock     = 0       ; seconds since start (ticks)
+g.lastrx    = 0       ; g.clock when we last heard from the server
+g.countdown = 0       ; seconds until next automatic poll
+g.minutes   = "?"     ; minutes left today (from prompt)
+g.btus      = "?"     ; BTUs (from prompt)
+g.lastpoll  = "never"
+
+; game data
+g.map     = {}        ; key "x,y" -> {x=, y=, c=}
+g.own     = {}        ; key "x,y" -> sector record (from dump)
+g.shipat  = {}        ; key "x,y" -> number of own ships there
+g.ships   = {}        ; list of ship records (from sdump)
+g.sectors = {}        ; list of sector records
+g.minx = 0
+g.maxx = -1
+g.miny = 0
+g.maxy = -1
+g.selship = -1        ; index into g.ships selected in the ships list
+
+/* ------------------------------------------------------------------
+** Small string helpers
+** ------------------------------------------------------------------ */
+Function p_IsSpace(c$)
+   Return(c$ = " " Or c$ = "\t" Or c$ = "\r" Or c$ = "\n")
+EndFunction
+
+Function p_Trim(s$)
+   Local a = 0
+   Local b = StrLen(s$) - 1
+   While a <= b
+      If Not p_IsSpace(MidStr(s$, a, 1)) Then Break
+      a = a + 1
+   Wend
+   While b >= a
+      If Not p_IsSpace(MidStr(s$, b, 1)) Then Break
+      b = b - 1
+   Wend
+   If b < a Then Return("")
+   Return(MidStr(s$, a, b - a + 1))
+EndFunction
+
+; split on runs of whitespace, returns a 0-based list
+Function p_Words(s$)
+   Local t = {}
+   Local cur$ = ""
+   Local n = StrLen(s$)
+   For Local i = 0 To n - 1
+      Local c$ = MidStr(s$, i, 1)
+      If p_IsSpace(c$)
+         If cur$ <> ""
+            InsertItem(t, cur$)
+            cur$ = ""
+         EndIf
+      Else
+         cur$ = cur$ .. c$
+      EndIf
+   Next
+   If cur$ <> "" Then InsertItem(t, cur$)
+   Return(t)
+EndFunction
+
+Function p_IsInt(s$)
+   Local n = StrLen(s$)
+   If n = 0 Then Return(False)
+   For Local i = 0 To n - 1
+      Local c$ = MidStr(s$, i, 1)
+      If c$ = "-" And i = 0 And n > 1
+         ; leading minus is fine
+      ElseIf FindStr("0123456789", c$) = -1
+         Return(False)
+      EndIf
+   Next
+   Return(True)
+EndFunction
+
+Function p_StartsWith(s$, prefix$)
+   Return(LeftStr(s$, StrLen(prefix$)) = prefix$)
+EndFunction
+
+Function p_Key(x, y)
+   Return(x .. "," .. y)
+EndFunction
+
+; field from a record built from a dump header, "" if missing
+Function p_F(rec, name$)
+   If IsNil(rec[name$]) Then Return("")
+   Return(rec[name$])
+EndFunction
+
+/* ------------------------------------------------------------------
+** Output window
+** ------------------------------------------------------------------ */
+Function p_Out(s$)
+   g.outbuf = g.outbuf .. s$ .. "\n"
+EndFunction
+
+Function p_FlushOutput()
+   If g.outbuf = "" Then Return
+   moai.DoMethod("output", "Insert", g.outbuf, "Bottom")
+   g.outbuf = ""
+EndFunction
+
+; local (non-server) message, shown immediately
+Function p_Log(s$)
+   p_Out("*** " .. s$)
+   p_FlushOutput()
+EndFunction
+
+/* ------------------------------------------------------------------
+** Status bar
+** ------------------------------------------------------------------ */
+Function p_FmtTime(secs)
+   If secs < 0 Then secs = 0
+   Local m = Floor(secs / 60)
+   Local s = secs - m * 60
+   Return(m .. ":" .. PadNum(s, 2))
+EndFunction
+
+; True while the login handshake is still running
+Function p_InLogin()
+   Local s$ = g.state
+   Return(s$ = "connecting" Or s$ = "user" Or s$ = "coun" Or s$ = "pass" Or s$ = "play")
+EndFunction
+
+Function p_UpdateStatus()
+   Local st$
+   If g.state = "offline"
+      st$ = "Offline"
+   ElseIf p_InLogin()
+      st$ = "Connecting..."
+   ElseIf g.state = "quit"
+      st$ = "Logging out..."
+   Else
+      st$ = "Online - " .. g.btus .. " BTU, " .. g.minutes .. " min"
+   EndIf
+
+   If IsNil(g.game)
+      st$ = st$ .. " | no game"
+   ElseIf g.state = "offline"
+      If g.game.autopoll
+         st$ = st$ .. " | next poll " .. p_FmtTime(g.countdown)
+      Else
+         st$ = st$ .. " | auto-poll off"
+      EndIf
+   EndIf
+   moai.Set("sbonline", "text", st$)
+
+   Local n = 0
+   Local list$ = ""
+   If Not IsNil(g.game)
+      n = ListItems(g.game.queue)
+      For Local i = 0 To n - 1
+         If i > 0 Then list$ = list$ .. " | "
+         list$ = list$ .. g.game.queue[i]
+      Next
+   EndIf
+   If list$ = "" Then list$ = "(empty)"
+   If StrLen(list$) > 160 Then list$ = LeftStr(list$, 157) .. "..."
+   moai.Set("sbqcount", "text", "Queued: " .. n)
+   moai.Set("sbqueue", "text", "Queue: " .. list$)
+EndFunction
+
+Function p_UpdateTitle()
+   Local t$ = #APPNAME
+   If Not IsNil(g.game)
+      t$ = t$ .. " - " .. g.game.name
+      If g.dirty Then t$ = t$ .. " *"
+   EndIf
+   moai.Set("mainwin", "title", t$)
+EndFunction
+
+Function p_SetDirty(d)
+   g.dirty = d
+   p_UpdateTitle()
+EndFunction
+
+/* ------------------------------------------------------------------
+** Game files (simple key=value text, one queued command per "queue=")
+** ------------------------------------------------------------------ */
+Function p_DefaultGame()
+   Return({
+      name     = "New game",
+      host     = "localhost",
+      port     = 6665,
+      user     = "EmpireBot",
+      country  = "",
+      password = "",
+      interval = 15,
+      autopoll = True,
+      maparea  = "*",
+      percmds  = "read",
+      warn     = True,
+      queue    = {}
+   })
+EndFunction
+
+Function p_SaveGame(path$)
+   Local gm = g.game
+   Local s$ = "# EmpireBot game file\n"
+   s$ = s$ .. "name=" .. gm.name .. "\n"
+   s$ = s$ .. "host=" .. gm.host .. "\n"
+   s$ = s$ .. "port=" .. gm.port .. "\n"
+   s$ = s$ .. "user=" .. gm.user .. "\n"
+   s$ = s$ .. "country=" .. gm.country .. "\n"
+   s$ = s$ .. "password=" .. gm.password .. "\n"
+   s$ = s$ .. "interval=" .. gm.interval .. "\n"
+   s$ = s$ .. "autopoll=" .. IIf(gm.autopoll, "1", "0") .. "\n"
+   s$ = s$ .. "maparea=" .. gm.maparea .. "\n"
+   s$ = s$ .. "percmds=" .. gm.percmds .. "\n"
+   s$ = s$ .. "warn=" .. IIf(gm.warn, "1", "0") .. "\n"
+   For Local i = 0 To ListItems(gm.queue) - 1
+      s$ = s$ .. "queue=" .. gm.queue[i] .. "\n"
+   Next
+   StringToFile(s$, path$)
+   g.filename = path$
+   p_SetDirty(False)
+   p_Log("Saved " .. path$)
+EndFunction
+
+Function p_LoadGame(path$)
+   Local gm = p_DefaultGame()
+   Local lines, n = SplitStr(FileToString(path$), "\n")
+   For Local i = 0 To n - 1
+      Local l$ = ReplaceStr(lines[i], "\r", "")
+      Local p = FindStr(l$, "=")
+      If p > 0 And Not p_StartsWith(l$, "#")
+         Local k$ = LowerStr(LeftStr(l$, p))
+         Local v$ = MidStr(l$, p + 1, StrLen(l$) - p - 1)
+         If k$ = "port" Or k$ = "interval"
+            gm[k$] = Val(v$)
+         ElseIf k$ = "autopoll" Or k$ = "warn"
+            gm[k$] = (v$ = "1")
+         ElseIf k$ = "queue"
+            InsertItem(gm.queue, v$)
+         Else
+            gm[k$] = v$
+         EndIf
+      EndIf
+   Next
+   If gm.interval < 1 Then gm.interval = 1
+   p_OpenGame(gm)
+   g.filename = path$
+   p_SetDirty(False)
+   p_Log("Opened " .. path$)
+EndFunction
+
+Function p_OpenGame(gm)
+   p_CloseGame(False)
+   g.game = gm
+   g.countdown = gm.interval * 60
+   moai.DoMethod("output", "Clear")
+   p_UpdateTitle()
+   p_UpdateStatus()
+EndFunction
+
+; returns False if the user cancelled
+Function p_ConfirmDiscard()
+   If IsNil(g.game) Or Not g.dirty Then Return(True)
+   Local r = moai.Request(#APPNAME, "Save changes to \"" .. g.game.name .. "\" first?", "Save|Discard|Cancel")
+   If r = 1
+      Return(p_DoSave())
+   ElseIf r = 2
+      Return(True)
+   EndIf
+   Return(False)
+EndFunction
+
+Function p_DoSave()
+   If IsNil(g.game)
+      moai.Request(#APPNAME, "No game is open.", "OK")
+      Return(False)
+   EndIf
+   Local path$ = g.filename
+   If path$ = ""
+      path$ = FileRequest("Save game", "ebot", #REQ_SAVEMODE)
+      If path$ = "" Then Return(False)
+      If LowerStr(RightStr(path$, 5)) <> ".ebot" Then path$ = path$ .. ".ebot"
+   EndIf
+   p_SaveGame(path$)
+   Return(True)
+EndFunction
+
+Function p_CloseGame(ask)
+   If ask
+      If Not p_ConfirmDiscard() Then Return(False)
+   EndIf
+   p_Disconnect()
+   g.game = Nil
+   g.filename = ""
+   g.dirty = False
+   p_ClearData()
+   p_UpdateTitle()
+   p_UpdateStatus()
+   Return(True)
+EndFunction
+
+/* ------------------------------------------------------------------
+** Settings window
+** ------------------------------------------------------------------ */
+Function p_ShowSettings()
+   If IsNil(g.game)
+      moai.Request(#APPNAME, "Open or create a game first.", "OK")
+      Return
+   EndIf
+   Local gm = g.game
+   moai.Set("setname", "text", gm.name)
+   moai.Set("sethost", "text", gm.host)
+   moai.Set("setport", "text", ToString(gm.port))
+   moai.Set("setuser", "text", gm.user)
+   moai.Set("setcountry", "text", gm.country)
+   moai.Set("setpass", "text", gm.password)
+   moai.Set("setinterval", "text", ToString(gm.interval))
+   moai.Set("setmaparea", "text", gm.maparea)
+   moai.Set("setpercmds", "text", gm.percmds)
+   moai.Set("setautopoll", "selected", gm.autopoll)
+   moai.Set("setwarn", "selected", gm.warn)
+   moai.Set("setwin", "open", True)
+EndFunction
+
+Function p_ApplySettings()
+   Local gm = g.game
+   If IsNil(gm) Then Return(True)
+   Local port = Val(moai.Get("setport", "text"))
+   Local interval = Val(moai.Get("setinterval", "text"))
+   If port < 1 Or port > 65535
+      moai.Request(#APPNAME, "Port must be between 1 and 65535.", "OK")
+      Return(False)
+   EndIf
+   If interval < 1
+      moai.Request(#APPNAME, "Poll interval must be at least 1 minute.", "OK")
+      Return(False)
+   EndIf
+   gm.name     = p_Trim(moai.Get("setname", "text"))
+   gm.host     = p_Trim(moai.Get("sethost", "text"))
+   gm.port     = port
+   gm.user     = p_Trim(moai.Get("setuser", "text"))
+   gm.country  = p_Trim(moai.Get("setcountry", "text"))
+   gm.password = moai.Get("setpass", "text")
+   gm.interval = interval
+   gm.maparea  = p_Trim(moai.Get("setmaparea", "text"))
+   gm.percmds  = p_Trim(moai.Get("setpercmds", "text"))
+   gm.autopoll = moai.Get("setautopoll", "selected")
+   gm.warn     = moai.Get("setwarn", "selected")
+   If gm.name = "" Then gm.name = "Unnamed game"
+   If gm.user = "" Then gm.user = "EmpireBot"
+   If gm.maparea = "" Then gm.maparea = "*"
+   g.countdown = gm.interval * 60
+   p_SetDirty(True)
+   p_UpdateStatus()
+   Return(True)
+EndFunction
+
+/* ------------------------------------------------------------------
+** Command queue
+** ------------------------------------------------------------------ */
+Function p_QueueCommand(cmd$)
+   cmd$ = p_Trim(cmd$)
+   If cmd$ = "" Then Return
+   If IsNil(g.game)
+      moai.Request(#APPNAME, "Open or create a game first.", "OK")
+      Return
+   EndIf
+   InsertItem(g.game.queue, cmd$)
+   p_SetDirty(True)
+   p_UpdateStatus()
+EndFunction
+
+Function p_ClearQueue()
+   If IsNil(g.game) Then Return
+   g.game.queue = {}
+   p_SetDirty(True)
+   p_UpdateStatus()
+EndFunction
+
+/* ------------------------------------------------------------------
+** Networking - Empire client protocol
+**
+** Every server line is "<id> <text>" where id is one hex digit:
+**   0 CMDOK  1 DATA  2 INIT  3 EXIT  4 FLUSH (sub-prompt)  5 NOECHO
+**   6 PROMPT "<minutes> <btus>"  7 ABORT  8 REDIR  9 PIPE
+**   a CMDERR  b BADCMD  c EXECUTE  d FLASH  e INFORM
+** Login: user <name> / coun <country> / pass <password> / play
+** ------------------------------------------------------------------ */
+Function p_Poll()
+   If IsNil(g.game)
+      moai.Request(#APPNAME, "Open or create a game first.", "OK")
+      Return
+   EndIf
+   If g.state <> "offline"
+      p_Log("Already connected - poll in progress.")
+      Return
+   EndIf
+   If g.game.country = ""
+      p_Log("No country set - open Settings > Game settings.")
+      Return
+   EndIf
+
+   p_Log("Connecting to " .. g.game.host .. ":" .. g.game.port .. " ...")
+   g.state = "connecting"
+   p_UpdateStatus()
+
+   ExitOnError(False)
+   GetLastError()
+   Local id = OpenConnection(Nil, g.game.host, g.game.port)
+   Local err = GetLastError()
+   ExitOnError(True)
+
+   If err <> 0
+      p_Log("Connect failed: " .. GetErrorName(err))
+      g.state = "offline"
+      g.countdown = g.game.interval * 60
+      p_UpdateStatus()
+      Return
+   EndIf
+
+   g.conn    = id
+   g.rxbuf   = ""
+   g.lastrx  = g.clock
+   g.thought = False
+   g.cur     = Nil
+   g.cmdout  = {}
+   p_BuildSession()
+EndFunction
+
+; commands for one session: per-poll commands, then the user queue
+; (drained live, so commands added while online still go out), then
+; the info commands that feed the map and lists
+Function p_BuildSession()
+   g.session = {}
+   Local parts, n = SplitStr(g.game.percmds, ";")
+   For Local i = 0 To n - 1
+      Local c$ = p_Trim(parts[i])
+      If c$ <> "" Then InsertItem(g.session, {cmd = c$, src = "bot"})
+   Next
+   InsertItem(g.session, {cmd = "", src = "queue"})
+   InsertItem(g.session, {cmd = "bmap " .. g.game.maparea, src = "info"})
+   InsertItem(g.session, {cmd = "dump *", src = "info"})
+   InsertItem(g.session, {cmd = "sdump *", src = "info"})
+EndFunction
+
+Function p_Send(s$)
+   If IsNil(g.conn) Then Return
+   ExitOnError(False)
+   GetLastError()
+   SendData(g.conn, s$ .. "\n")
+   Local err = GetLastError()
+   ExitOnError(True)
+   If err <> 0
+      p_Log("Send failed: " .. GetErrorName(err))
+      p_Disconnect()
+   EndIf
+EndFunction
+
+Function p_Disconnect()
+   If Not IsNil(g.conn)
+      ExitOnError(False)
+      CloseConnection(g.conn)
+      ExitOnError(True)
+      g.conn = Nil
+      p_Log("Disconnected.")
+   EndIf
+   g.state = "offline"
+   g.session = {}
+   g.cur = Nil
+   If Not IsNil(g.game) Then g.countdown = g.game.interval * 60
+   p_UpdateStatus()
+EndFunction
+
+; next session item, Nil when the session is finished. The "queue"
+; marker stays in place until the user queue is empty; queued commands
+; are removed in p_CommandDone() once the server has answered them.
+Function p_NextItem()
+   While ListItems(g.session) > 0
+      Local item = g.session[0]
+      If item.src = "queue"
+         If ListItems(g.game.queue) > 0 Then Return({cmd = g.game.queue[0], src = "queue"})
+         RemoveItem(g.session, 0)
+      Else
+         RemoveItem(g.session, 0)
+         Return(item)
+      EndIf
+   Wend
+   Return(Nil)
+EndFunction
+
+; send the next command of the session, or log out when done
+Function p_SendNext()
+   If g.state <> "ready" Then Return
+
+   g.cur = p_NextItem()
+   If IsNil(g.cur) And Not g.thought
+      g.thought = True
+      p_BotThink()
+      g.cur = p_NextItem()
+   EndIf
+
+   If IsNil(g.cur)
+      g.state = "quit"
+      p_UpdateStatus()
+      p_Send("quit")
+      Return
+   EndIf
+
+   g.cmdout = {}
+   g.flushes = 0
+   g.state = "cmd"
+   p_Out("> " .. g.cur.cmd)
+   p_Send(g.cur.cmd)
+EndFunction
+
+; called when the prompt comes back after g.cur
+Function p_CommandDone()
+   Local cur = g.cur
+   g.cur = Nil
+   If IsNil(cur) Then Return
+
+   Local w = p_Words(cur.cmd)
+   Local verb$ = ""
+   If ListItems(w) > 0 Then verb$ = LowerStr(w[0])
+   If verb$ = "bmap" Or verb$ = "map"
+      p_ParseMap(g.cmdout)
+   ElseIf verb$ = "dump"
+      p_ParseDump(g.cmdout)
+   ElseIf verb$ = "sdump"
+      p_ParseShips(g.cmdout)
+   EndIf
+
+   If cur.src = "queue" And Not IsNil(g.game)
+      If ListItems(g.game.queue) > 0
+         If g.game.queue[0] = cur.cmd Then RemoveItem(g.game.queue, 0)
+      EndIf
+      p_SetDirty(True)
+   EndIf
+   g.cmdout = {}
+EndFunction
+
+Function p_HandleLine(line$)
+   If StrLen(line$) = 0 Then Return
+   Local code$ = LowerStr(LeftStr(line$, 1))
+   Local text$ = ""
+   If StrLen(line$) > 2 Then text$ = MidStr(line$, 2, StrLen(line$) - 2)
+   g.lastrx = g.clock
+
+   ; fold codes that are handled the same way
+   Local kind$ = ""
+   If code$ = "b" Then code$ = "a"        ; BADCMD -> CMDERR
+   If code$ = "e"                         ; INFORM -> FLASH
+      kind$ = "inform"
+      code$ = "d"
+   ElseIf code$ = "d"
+      kind$ = "flash"
+   EndIf
+
+   Switch code$
+   Case "1":   ; C_DATA
+      p_Out(text$)
+      If g.state = "cmd" Then InsertItem(g.cmdout, text$)
+
+   Case "2":   ; C_INIT
+      If g.state = "connecting"
+         p_Out(text$)
+         g.state = "user"
+         p_Send("user " .. g.game.user)
+      EndIf
+
+   Case "0":   ; C_CMDOK - login steps
+      Switch g.state
+      Case "user":
+         g.state = "coun"
+         p_Send("coun " .. g.game.country)
+      Case "coun":
+         g.state = "pass"
+         p_Send("pass " .. g.game.password)
+      Case "pass":
+         g.state = "play"
+         p_Send("play")
+      EndSwitch
+
+   Case "6":   ; C_PROMPT "<minutes> <btus>"
+      Local pw = p_Words(text$)
+      If ListItems(pw) >= 2
+         g.minutes = pw[0]
+         g.btus = pw[1]
+      EndIf
+      If g.state = "play"
+         g.state = "ready"
+         g.lastpoll = GetDate() .. " " .. GetTime(True)
+         p_Log("Logged in as " .. g.game.country .. ".")
+      ElseIf g.state = "cmd"
+         p_CommandDone()
+         g.state = "ready"
+      EndIf
+      p_UpdateStatus()
+      p_SendNext()
+
+   Case "4":   ; C_FLUSH - server wants more input for this command
+      p_Out(text$)
+      g.flushes = g.flushes + 1
+      ; an empty reply aborts/defaults the sub-prompt; never get stuck
+      p_Send("")
+
+   Case "a":   ; C_CMDERR / C_BADCMD
+      p_Out("!! " .. text$)
+      If p_InLogin()
+         p_Log("Login failed: " .. text$)
+         p_Disconnect()
+      EndIf
+
+   Case "3":   ; C_EXIT
+      p_Out(text$)
+      p_Disconnect()
+      p_RefreshViews()
+
+   Case "d":   ; C_FLASH / C_INFORM
+      p_Out("[" .. kind$ .. "] " .. text$)
+
+   Case "7":   ; C_ABORT
+      p_Out("(aborted) " .. text$)
+
+   Case "5":   ; C_NOECHO
+      ; nothing to do - we never echo locally
+
+   Default:    ; redir / pipe / execute: not supported by the bot
+      p_Out("(ignored " .. code$ .. ") " .. text$)
+   EndSwitch
+EndFunction
+
+Function p_OnNetData(msg)
+   If IsNil(g.conn) Then Return
+   If msg.ID <> g.conn Then Return
+
+   Local chunk$ = ""
+   Local closed = False
+   ExitOnError(False)
+   GetLastError()
+   Repeat
+      Local d$, cnt, done = ReceiveData(g.conn, #RECEIVEALL, False)
+      If GetLastError() <> 0
+         closed = True
+         Break
+      EndIf
+      chunk$ = chunk$ .. d$
+      If cnt = 0 Then done = True
+   Until done
+   ExitOnError(True)
+
+   g.rxbuf = g.rxbuf .. chunk$
+   Local p = FindStr(g.rxbuf, "\n")
+   While p > -1
+      Local line$ = ReplaceStr(LeftStr(g.rxbuf, p), "\r", "")
+      g.rxbuf = MidStr(g.rxbuf, p + 1, StrLen(g.rxbuf) - p - 1)
+      p_HandleLine(line$)
+      If IsNil(g.conn) Then Break
+      p = FindStr(g.rxbuf, "\n")
+   Wend
+   p_FlushOutput()
+
+   If closed And Not IsNil(g.conn)
+      p_Log("Server closed the connection.")
+      p_Disconnect()
+      p_RefreshViews()
+   EndIf
+EndFunction
+
+/* ------------------------------------------------------------------
+** Parsers
+** ------------------------------------------------------------------ */
+
+; bmap/map output: stacked x-coordinate header lines, then rows of
+; "  y  <chars>  y". The header digits above a column give its x.
+Function p_ParseMap(lines)
+   Local hdr = {}
+   Local hdrx = {}
+   Local inrows = False
+   Local count = 0
+   Local n = ListItems(lines)
+
+   For Local i = 0 To n - 1
+      Local l$ = lines[i]
+      Local w = p_Words(l$)
+      Local nw = ListItems(w)
+      Local isrow = False
+      If nw >= 2
+         If p_IsInt(w[0]) And w[0] = w[nw - 1] Then isrow = True
+      EndIf
+
+      If isrow
+         If Not inrows
+            ; build column -> x lookup from the header lines
+            inrows = True
+            Local maxlen = 0
+            For Local h = 0 To ListItems(hdr) - 1
+               maxlen = Max(maxlen, StrLen(hdr[h]))
+            Next
+            For Local c = 0 To maxlen - 1
+               Local s$ = ""
+               For Local h = 0 To ListItems(hdr) - 1
+                  Local ch$ = MidStr(hdr[h], c, 1)
+                  If ch$ <> "" And ch$ <> " " Then s$ = s$ .. ch$
+               Next
+               If p_IsInt(s$) Then hdrx[c] = Val(s$)
+            Next
+         EndIf
+         Local y = Val(w[0])
+         ; first content column = just after the left y label
+         Local lab = FindStr(l$, w[0])
+         Local start = lab + StrLen(w[0])
+         Local stop = StrLen(l$) - 1
+         Local rlab = StrLen(l$) - StrLen(w[nw - 1])
+         If rlab > start Then stop = rlab - 1
+         For Local c = start To stop
+            If Not IsNil(hdrx[c])
+               Local ch$ = MidStr(l$, c, 1)
+               If ch$ <> " "
+                  Local x = hdrx[c]
+                  g.map[p_Key(x, y)] = {x = x, y = y, c = ch$}
+                  count = count + 1
+               EndIf
+            EndIf
+         Next
+      ElseIf Not inrows
+         ; candidate header line: only spaces, digits and minus signs
+         Local ok = (p_Trim(l$) <> "")
+         For Local c = 0 To StrLen(l$) - 1
+            If FindStr(" -0123456789", MidStr(l$, c, 1)) = -1
+               ok = False
+               Break
+            EndIf
+         Next
+         If ok Then InsertItem(hdr, l$)
+      EndIf
+   Next
+   p_Log("Map: " .. count .. " sectors read.")
+EndFunction
+
+; header line (column names) followed by rows of values
+Function p_ParseTable(lines, marker$)
+   Local recs = {}
+   Local names = Nil
+   Local active = False
+   For Local i = 0 To ListItems(lines) - 1
+      Local l$ = lines[i]
+      If p_StartsWith(l$, marker$)
+         active = True
+         names = Nil
+      ElseIf active
+         Local w = p_Words(l$)
+         If IsNil(names)
+            names = w
+         ElseIf ListItems(w) = 0
+            ; blank line
+         ElseIf Not p_IsInt(w[0]) Or ListItems(w) < 3
+            active = False   ; "N sectors" / "N ships" footer
+         Else
+            Local rec = {}
+            For Local k = 0 To Min(ListItems(names), ListItems(w)) - 1
+               rec[names[k]] = w[k]
+            Next
+            InsertItem(recs, rec)
+         EndIf
+      EndIf
+   Next
+   Return(recs)
+EndFunction
+
+Function p_ParseDump(lines)
+   g.sectors = p_ParseTable(lines, "DUMP SECTOR")
+   g.own = {}
+   For Local i = 0 To ListItems(g.sectors) - 1
+      Local s = g.sectors[i]
+      Local x = Val(p_F(s, "x"))
+      Local y = Val(p_F(s, "y"))
+      Local k$ = p_Key(x, y)
+      g.own[k$] = s
+      If p_F(s, "des") <> "" Then g.map[k$] = {x = x, y = y, c = p_F(s, "des")}
+   Next
+   p_Log("Sectors: " .. ListItems(g.sectors) .. " owned.")
+EndFunction
+
+Function p_ParseShips(lines)
+   g.ships = p_ParseTable(lines, "DUMP SHIPS")
+   g.shipat = {}
+   For Local i = 0 To ListItems(g.ships) - 1
+      Local s = g.ships[i]
+      Local k$ = p_Key(Val(p_F(s, "x")), Val(p_F(s, "y")))
+      If IsNil(g.shipat[k$]) Then g.shipat[k$] = 0
+      g.shipat[k$] = g.shipat[k$] + 1
+   Next
+   g.selship = -1
+   p_Log("Ships: " .. ListItems(g.ships) .. ".")
+EndFunction
+
+/* ------------------------------------------------------------------
+** Bot brain - runs once per session after all info has been fetched.
+** Add commands with p_BotDo("command") and they are executed before
+** the bot logs out. Keep rules conservative: the bot plays your
+** country while you are away.
+** ------------------------------------------------------------------ */
+Function p_BotDo(cmd$)
+   InsertItem(g.session, {cmd = cmd$, src = "bot"})
+   p_Out("[bot] queued: " .. cmd$)
+EndFunction
+
+Function p_BotThink()
+   If IsNil(g.game) Then Return
+   If Not g.game.warn Then Return
+
+   ; Warning: populated sectors with no food will starve at the update
+   For Local i = 0 To ListItems(g.sectors) - 1
+      Local s = g.sectors[i]
+      If Val(p_F(s, "civ")) > 0 And p_F(s, "food") <> "" And Val(p_F(s, "food")) = 0
+         p_Out("[bot] WARNING: sector " .. p_F(s, "x") .. "," .. p_F(s, "y") .. " has " .. p_F(s, "civ") .. " civilians and no food")
+      EndIf
+   Next
+
+   ; Note: ships sitting at full mobility are idle
+   Local idle = 0
+   For Local i = 0 To ListItems(g.ships) - 1
+      If Val(p_F(g.ships[i], "mob")) >= 127 Then idle = idle + 1
+   Next
+   If idle > 0 Then p_Out("[bot] " .. idle .. " ship(s) at full mobility (idle)")
+
+   ; Example action (disabled): keep telegrams read every session
+   ; p_BotDo("read")
+EndFunction
+
+/* ------------------------------------------------------------------
+** Views: map canvas, ship and sector lists
+** ------------------------------------------------------------------ */
+Function p_ClearData()
+   g.map = {}
+   g.own = {}
+   g.shipat = {}
+   g.ships = {}
+   g.sectors = {}
+   g.selship = -1
+   p_RefreshViews()
+EndFunction
+
+Function p_RefreshViews()
+   ; map bounds
+   Local first = True
+   For Local k, c In Pairs(g.map)
+      If first
+         g.minx = c.x
+         g.maxx = c.x
+         g.miny = c.y
+         g.maxy = c.y
+         first = False
+      Else
+         g.minx = Min(g.minx, c.x)
+         g.maxx = Max(g.maxx, c.x)
+         g.miny = Min(g.miny, c.y)
+         g.maxy = Max(g.maxy, c.y)
+      EndIf
+   Next
+   If first
+      g.minx = 0
+      g.maxx = -1
+      g.miny = 0
+      g.maxy = -1
+      moai.Set("maplegend", "text", "No map yet - poll the server to fetch one.")
+   Else
+      moai.Set("maplegend", "text", "x " .. g.minx .. ".." .. g.maxx .. ", y " .. g.miny .. ".." .. g.maxy .. "   |   owned sectors highlighted, cyan dot = your ships   |   last poll: " .. g.lastpoll)
+   EndIf
+
+   Local vw = #MARGINL + Max(1, g.maxx - g.minx + 1) * #CELLW + #CELLW
+   Local vh = #MARGINT + Max(1, g.maxy - g.miny + 1) * #CELLH + #CELLH
+   moai.Set("map", "virtwidth", Max(vw, 200))
+   moai.Set("map", "virtheight", Max(vh, 120))
+   moai.DoMethod("map", "redraw")
+
+   ; ships
+   moai.DoMethod("shiplist", "clear")
+   For Local i = 0 To ListItems(g.ships) - 1
+      Local s = g.ships[i]
+      moai.DoMethod("shiplist", "insert", "bottom", p_F(s, "id"), p_F(s, "type"), p_F(s, "x"), p_F(s, "y"), p_F(s, "flt"), p_F(s, "eff"), p_F(s, "mob"), p_F(s, "mil"), p_F(s, "food"), p_F(s, "tech"))
+   Next
+
+   ; sectors
+   moai.DoMethod("sectlist", "clear")
+   For Local i = 0 To ListItems(g.sectors) - 1
+      Local s = g.sectors[i]
+      moai.DoMethod("sectlist", "insert", "bottom", p_F(s, "x"), p_F(s, "y"), p_F(s, "des"), p_F(s, "eff"), p_F(s, "mob"), p_F(s, "civ"), p_F(s, "mil"), p_F(s, "food"), p_F(s, "work"))
+   Next
+EndFunction
+
+; colours for designation characters
+Function p_CellColors(c$, owned)
+   Local bg = $1C2430
+   Local fg = $B0B8C0
+   Switch c$
+   Case ".":
+      bg = $14305A
+      fg = $5080C0
+   Case "^":
+      bg = $3A3A3A
+      fg = $D0D0D0
+   Case "-":
+      bg = $1E3A1E
+      fg = $70A070
+   Case "\\":
+      bg = $2A2018
+      fg = $806040
+   Case "?":
+      fg = $707070
+   EndSwitch
+   If owned
+      bg = $2E6B2E
+      fg = $FFF080
+   EndIf
+   Return(bg, fg)
+EndFunction
+
+Function p_PaintMap(msg)
+   SelectBrush(msg.Brush)
+   SetFillStyle(#FILLCOLOR)
+   Box(msg.X, msg.Y, msg.Width, msg.Height, $101418)
+   SetFont(#MONOSPACE, 12)
+   SetFontStyle(#NORMAL)
+
+   If g.maxx < g.minx
+      SetFontColor($A0A0A0)
+      TextOut(10 - msg.ScrollX, 10 - msg.ScrollY, "No map data yet. Use Actions > Poll server now.")
+      EndSelect()
+      Return
+   EndIf
+
+   Local ax0 = msg.ScrollX + msg.X
+   Local ay0 = msg.ScrollY + msg.Y
+   Local c0 = Max(0, Floor((ax0 - #MARGINL) / #CELLW))
+   Local c1 = Floor((ax0 + msg.Width - #MARGINL) / #CELLW)
+   Local r0 = Max(0, Floor((ay0 - #MARGINT) / #CELLH))
+   Local r1 = Floor((ay0 + msg.Height - #MARGINT) / #CELLH)
+   c1 = Min(c1, g.maxx - g.minx)
+   r1 = Min(r1, g.maxy - g.miny)
+
+   ; selected ship position
+   Local selk$ = ""
+   If g.selship >= 0 And g.selship < ListItems(g.ships)
+      Local s = g.ships[g.selship]
+      selk$ = p_Key(Val(p_F(s, "x")), Val(p_F(s, "y")))
+   EndIf
+
+   ; rulers
+   SetFontColor($8090A0)
+   For Local col = c0 To c1
+      Local x = g.minx + col
+      If x % 5 = 0 Then TextOut(#MARGINL + col * #CELLW - msg.ScrollX, 2 - msg.ScrollY, ToString(x))
+   Next
+   For Local row = r0 To r1
+      TextOut(2 - msg.ScrollX, #MARGINT + row * #CELLH - msg.ScrollY, ToString(g.miny + row))
+   Next
+
+   ; cells
+   For Local row = r0 To r1
+      Local y = g.miny + row
+      Local py = #MARGINT + row * #CELLH - msg.ScrollY
+      For Local col = c0 To c1
+         Local x = g.minx + col
+         Local k$ = p_Key(x, y)
+         Local cell = g.map[k$]
+         If Not IsNil(cell)
+            Local px = #MARGINL + col * #CELLW - msg.ScrollX
+            Local bg, fg = p_CellColors(cell.c, Not IsNil(g.own[k$]))
+            Box(px, py, #CELLW - 1, #CELLH - 1, bg)
+            SetFontColor(fg)
+            TextOut(px + 2, py + 1, cell.c)
+            If Not IsNil(g.shipat[k$]) Then Box(px + #CELLW - 5, py + 1, 3, 3, $40E0FF)
+            If k$ = selk$
+               SetFillStyle(#FILLNONE)
+               Box(px - 1, py - 1, #CELLW + 1, #CELLH + 1, $FF4040)
+               SetFillStyle(#FILLCOLOR)
+            EndIf
+         EndIf
+      Next
+   Next
+   EndSelect()
+EndFunction
+
+/* ------------------------------------------------------------------
+** Help / about
+** ------------------------------------------------------------------ */
+Function p_InitHelp()
+   Local t$ = "EmpireBot " .. #APPVER .. "\n\n"
+   t$ = t$ .. "EmpireBot logs into a Wolfpack Empire server on a timer, runs\n"
+   t$ = t$ .. "commands for you, and shows your map, sectors and ships.\n\n"
+   t$ = t$ .. "GETTING STARTED\n"
+   t$ = t$ .. "  1. File > New, then fill in host, port (default 6665), country\n"
+   t$ = t$ .. "     and password in the settings window.\n"
+   t$ = t$ .. "  2. Actions > Poll server now (Ctrl+P) to connect immediately.\n"
+   t$ = t$ .. "  3. File > Save stores the game (including queued commands).\n\n"
+   t$ = t$ .. "EACH POLL\n"
+   t$ = t$ .. "  - logs in (user / coun / pass / play)\n"
+   t$ = t$ .. "  - runs the 'Commands each poll' list (separate with ;)\n"
+   t$ = t$ .. "  - runs every queued command, oldest first\n"
+   t$ = t$ .. "  - fetches 'bmap <map area>', 'dump *' and 'sdump *'\n"
+   t$ = t$ .. "  - lets the bot brain add commands, then logs out\n\n"
+   t$ = t$ .. "COMMAND QUEUE\n"
+   t$ = t$ .. "  Type an Empire command in the Command box and press Enter or\n"
+   t$ = t$ .. "  Queue. It is sent at the next poll and removed once the server\n"
+   t$ = t$ .. "  has answered. The status bar shows the queue.\n"
+   t$ = t$ .. "  Sub-prompts are answered with an empty line, so give commands\n"
+   t$ = t$ .. "  all their arguments, e.g.  move f 0,0 100 2,0\n\n"
+   t$ = t$ .. "MAP\n"
+   t$ = t$ .. "  Map area accepts anything bmap does: * for the whole world, a\n"
+   t$ = t$ .. "  realm like #1, or an area like -16:15,-8:7. Owned sectors are\n"
+   t$ = t$ .. "  highlighted; a cyan dot marks your ships. Select a ship in the\n"
+   t$ = t$ .. "  Ships tab to outline its sector in red.\n\n"
+   t$ = t$ .. "NOTES\n"
+   t$ = t$ .. "  The bot logs out after each poll so you can still play\n"
+   t$ = t$ .. "  yourself. If your country is already logged in, the poll fails\n"
+   t$ = t$ .. "  and is retried at the next interval.\n"
+   t$ = t$ .. "  Game files store the password in plain text.\n"
+   moai.DoMethod("helptext", "Insert", t$, "Top")
+   moai.Set("abouttitle", "text", #APPNAME)
+   moai.Set("aboutver", "text", "Version " .. #APPVER)
+EndFunction
+
+/* ------------------------------------------------------------------
+** Events
+** ------------------------------------------------------------------ */
+Function p_Quit()
+   If Not p_ConfirmDiscard() Then Return
+   p_Disconnect()
+   End
+EndFunction
+
+Function p_MenuSelected(id$)
+   Switch id$
+   Case "mnew":
+      If p_ConfirmDiscard()
+         p_OpenGame(p_DefaultGame())
+         p_SetDirty(True)
+         p_ShowSettings()
+      EndIf
+   Case "mopen":
+      If p_ConfirmDiscard()
+         Local f$ = FileRequest("Open game", "ebot")
+         If f$ <> "" Then p_LoadGame(f$)
+      EndIf
+   Case "mclose":
+      p_CloseGame(True)
+   Case "msave":
+      p_DoSave()
+   Case "mquit":
+      p_Quit()
+   Case "mpoll":
+      p_Poll()
+   Case "mdisconnect":
+      p_Disconnect()
+   Case "mclearq":
+      p_ClearQueue()
+   Case "msettings":
+      p_ShowSettings()
+   Case "mhelp":
+      moai.Set("helpwin", "open", True)
+   Case "mabout":
+      moai.Set("aboutwin", "open", True)
+   EndSwitch
+EndFunction
+
+Function p_EventFunc(msg)
+   Switch msg.Class
+   Case "Menuitem":
+      If msg.Attribute = "Selected" Then p_MenuSelected(msg.ID)
+
+   Case "Button":
+      Switch msg.ID
+      Case "btnqueue":
+         p_QueueCommand(moai.Get("cmdentry", "text"))
+         moai.Set("cmdentry", "text", "")
+      Case "btnpoll":
+         p_Poll()
+      Case "btnclearq":
+         p_ClearQueue()
+      Case "setok":
+         If p_ApplySettings() Then moai.Set("setwin", "open", False)
+      Case "setcancel":
+         moai.Set("setwin", "open", False)
+      Case "helpclose":
+         moai.Set("helpwin", "open", False)
+      Case "aboutok":
+         moai.Set("aboutwin", "open", False)
+      EndSwitch
+
+   Case "Textentry":
+      If msg.ID = "cmdentry" And msg.Attribute = "Acknowledge"
+         p_QueueCommand(moai.Get("cmdentry", "text"))
+         moai.Set("cmdentry", "text", "")
+      EndIf
+
+   Case "Listview":
+      If msg.ID = "shiplist" And msg.Attribute = "Active"
+         g.selship = msg.TriggerValue
+         moai.DoMethod("map", "redraw")
+      EndIf
+
+   Case "Scrollcanvas":
+      If msg.Attribute = "Paint" Then p_PaintMap(msg)
+
+   Case "Window":
+      If msg.ID = "mainwin" And msg.Attribute = "CloseRequest" Then p_Quit()
+   EndSwitch
+EndFunction
+
+Function p_Tick(msg)
+   g.clock = g.clock + 1
+
+   If g.state <> "offline" And g.clock - g.lastrx > #NETTIMEOUT
+      p_Log("No answer from server for " .. #NETTIMEOUT .. "s - giving up.")
+      p_Disconnect()
+      p_RefreshViews()
+   EndIf
+
+   If Not IsNil(g.game)
+      If g.game.autopoll And g.state = "offline"
+         g.countdown = g.countdown - 1
+         If g.countdown <= 0
+            g.countdown = g.game.interval * 60
+            p_Poll()
+         EndIf
+      EndIf
+   EndIf
+   p_UpdateStatus()
+EndFunction
+
+/* ------------------------------------------------------------------
+** Startup
+** ------------------------------------------------------------------ */
+InstallEventHandler({RapaGUI = p_EventFunc, OnReceiveData = p_OnNetData})
+moai.CreateApp(FileToString("EmpireBot.xml"))
+p_InitHelp()
+p_UpdateTitle()
+p_UpdateStatus()
+p_Log(#APPNAME .. " " .. #APPVER .. " ready. File > New to set up a game.")
+SetInterval(1, p_Tick, 1000)
+
+Repeat
+   WaitEvent
+Forever
