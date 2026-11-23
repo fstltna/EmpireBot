@@ -12,7 +12,7 @@
 */
 
 @VERSION 9,0
-@REQUIRE "RapaGUI"
+@REQUIRE "RapaGUI", {Link = True}
 @APPTITLE "EmpireBot"
 @APPVERSION "$VER: EmpireBot 1.0.0 (23.11.26)"
 @APPCOPYRIGHT "(C) 2026"
