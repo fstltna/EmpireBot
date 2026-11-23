@@ -192,7 +192,11 @@ Function p_UpdateStatus()
          st$ = st$ .. " | auto-poll off"
       EndIf
    EndIf
+   ExitOnError(False)
+   GetLastError()
    moai.Set("sbonline", "text", st$)
+   p_Chk("status: sbonline")
+   ExitOnError(True)
 
    Local n = 0
    Local list$ = ""
@@ -205,8 +209,16 @@ Function p_UpdateStatus()
    EndIf
    If list$ = "" Then list$ = "(empty)"
    If StrLen(list$) > 160 Then list$ = LeftStr(list$, 157) .. "..."
+   ExitOnError(False)
+   GetLastError()
    moai.Set("sbqcount", "text", "Queued: " .. n)
+   p_Chk("status: sbqcount")
+   ExitOnError(True)
+   ExitOnError(False)
+   GetLastError()
    moai.Set("sbqueue", "text", "Queue: " .. list$)
+   p_Chk("status: sbqueue")
+   ExitOnError(True)
 EndFunction
 
 Function p_UpdateTitle()
@@ -966,17 +978,42 @@ Function p_CellColors(c$, owned)
    Return(bg, fg)
 EndFunction
 
+; error trap for callbacks: RapaGUI callbacks report errors without a
+; line number, so risky calls are checked and logged by name instead
+g.errseen = {}
+Function p_Chk(where$)
+   Local err = GetLastError()
+   If err <> 0
+      If IsNil(g.errseen[where$])
+         g.errseen[where$] = True
+         p_Log("ERROR in " .. where$ .. ": " .. GetErrorName(err))
+      EndIf
+   EndIf
+EndFunction
+
 Function p_PaintMap(msg)
+   If msg.Width < 1 Or msg.Height < 1 Then Return
+   ExitOnError(False)
+   GetLastError()
    SelectBrush(msg.Brush)
+   p_Chk("paint: SelectBrush")
    SetFillStyle(#FILLCOLOR)
+   p_Chk("paint: SetFillStyle")
    Box(msg.X, msg.Y, msg.Width, msg.Height, $101418)
+   p_Chk("paint: Box")
    SetFont(#MONOSPACE, 12)
+   p_Chk("paint: SetFont")
    SetFontStyle(#NORMAL)
+   p_Chk("paint: SetFontStyle")
 
    If g.maxx < g.minx
       SetFontColor($A0A0A0)
+      p_Chk("paint: SetFontColor")
       TextOut(10 - msg.ScrollX, 10 - msg.ScrollY, "No map data yet. Use Actions > Poll server now.")
+      p_Chk("paint: TextOut")
       EndSelect()
+      p_Chk("paint: EndSelect")
+      ExitOnError(True)
       Return
    EndIf
 
@@ -1029,7 +1066,10 @@ Function p_PaintMap(msg)
          EndIf
       Next
    Next
+   p_Chk("paint: cells")
    EndSelect()
+   p_Chk("paint: EndSelect")
+   ExitOnError(True)
 EndFunction
 
 /* ------------------------------------------------------------------
