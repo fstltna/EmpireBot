@@ -82,8 +82,8 @@
          </hgroup>
 
          <statusbar>
-            <item id="sbonline" width="30">Offline</item>
-            <item id="sbqcount" width="12">Queued: 0</item>
+            <item id="sbonline" width="360">Offline</item>
+            <item id="sbqcount" width="110">Queued: 0</item>
             <item id="sbqueue">Queue: (empty)</item>
          </statusbar>
       </vgroup>

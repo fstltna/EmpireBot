@@ -633,6 +633,14 @@ Function p_HandleLine(line$)
    Case "1":   ; C_DATA
       p_Out(text$)
       If g.state = "cmd" Then InsertItem(g.cmdout, text$)
+      ; the server refused one of the bot's own info commands
+      If g.state = "cmd" And FindStr(text$, "is not a legal command") > -1
+         If GetType(g.cur) = #TABLE
+            If g.cur.src = "info"
+               p_Out("*** Your country can't use '" .. g.cur.cmd .. "'. Queue 'nation' to check its status - visitor and not-yet-started countries can't get maps or dumps.")
+            EndIf
+         EndIf
+      EndIf
 
    Case "2":   ; C_INIT
       If g.state = "connecting"
