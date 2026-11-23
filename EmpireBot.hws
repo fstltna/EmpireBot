@@ -1166,7 +1166,7 @@ Function p_MenuSelected(id$)
    Case "mhelp":
       p_OpenWindow("helpwin", 560, 480)
    Case "mabout":
-      p_OpenWindow("aboutwin", 380, 260)
+      p_OpenWindow("aboutwin", 400, 280)
    EndSwitch
 EndFunction
 

@@ -95,31 +95,31 @@
          <vgroup frame="true" frametitle="Server">
             <colgroup columns="2">
                <label>Game name:</label>
-               <textentry id="setname"/>
+               <textentry id="setname" width="300"/>
                <label>Host:</label>
-               <textentry id="sethost"/>
+               <textentry id="sethost" width="300"/>
                <label>Port:</label>
-               <textentry id="setport"/>
+               <textentry id="setport" width="300"/>
             </colgroup>
          </vgroup>
          <vgroup frame="true" frametitle="Login">
             <colgroup columns="2">
                <label>Player name:</label>
-               <textentry id="setuser"/>
+               <textentry id="setuser" width="300"/>
                <label>Country:</label>
-               <textentry id="setcountry"/>
+               <textentry id="setcountry" width="300"/>
                <label>Password:</label>
-               <textentry id="setpass" password="true"/>
+               <textentry id="setpass" width="300" password="true"/>
             </colgroup>
          </vgroup>
          <vgroup frame="true" frametitle="Polling">
             <colgroup columns="2">
                <label>Poll every (minutes):</label>
-               <textentry id="setinterval"/>
+               <textentry id="setinterval" width="300"/>
                <label>Map area:</label>
-               <textentry id="setmaparea"/>
+               <textentry id="setmaparea" width="300"/>
                <label>Commands each poll:</label>
-               <textentry id="setpercmds"/>
+               <textentry id="setpercmds" width="300"/>
             </colgroup>
             <checkbox id="setautopoll">Poll the server automatically</checkbox>
             <checkbox id="setwarn">Bot warnings (starving sectors, idle ships)</checkbox>
@@ -145,11 +145,7 @@
    <window id="aboutwin" title="About EmpireBot" width="380" height="260" open="false">
       <vgroup>
          <rectangle/>
-         <hgroup>
-            <rectangle/>
-            <text id="abouttext">EmpireBot</text>
-            <rectangle/>
-         </hgroup>
+         <text id="abouttext" width="340">EmpireBot</text>
          <rectangle/>
          <hgroup>
             <rectangle/>
