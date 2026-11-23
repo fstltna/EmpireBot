@@ -35,15 +35,20 @@ Const #NETTIMEOUT = 90
 ** Global state
 ** ------------------------------------------------------------------ */
 g = {}
-g.game      = Nil     ; current game settings table (Nil = no game open)
+g.game      = {}      ; current game settings table
+g.hasgame   = False   ; True while a game is open
+; NOTE: Hollywood raises an error when reading a table field that was
+; never set (and assigning Nil deletes a field), so state uses flags
+; and lookups go through HaveItem() instead of IsNil().
 g.filename  = ""      ; file the game was loaded from / saved to
 g.dirty     = False   ; unsaved changes
-g.conn      = Nil     ; network connection handle
+g.conn      = 0       ; network connection handle
+g.connected = False   ; True while g.conn is valid
 g.state     = "offline"
 g.rxbuf     = ""      ; partial line buffer
 g.outbuf    = ""      ; text waiting to go to the output widget
 g.session   = {}      ; commands still to send this session
-g.cur       = Nil     ; command currently running {cmd=, src=}
+g.cur       = False   ; command currently running {cmd=, src=}, False if none
 g.cmdout    = {}      ; data lines produced by g.cur
 g.thought   = False   ; p_BotThink() already ran this session
 g.flushes   = 0       ; sub-prompts answered for the current command
@@ -132,7 +137,7 @@ EndFunction
 
 ; field from a record built from a dump header, "" if missing
 Function p_F(rec, name$)
-   If IsNil(rec[name$]) Then Return("")
+   If Not HaveItem(rec, name$) Then Return("")
    Return(rec[name$])
 EndFunction
 
@@ -183,7 +188,7 @@ Function p_UpdateStatus()
       st$ = "Online - " .. g.btus .. " BTU, " .. g.minutes .. " min"
    EndIf
 
-   If IsNil(g.game)
+   If Not g.hasgame
       st$ = st$ .. " | no game"
    ElseIf g.state = "offline"
       If g.game.autopoll
@@ -200,7 +205,7 @@ Function p_UpdateStatus()
 
    Local n = 0
    Local list$ = ""
-   If Not IsNil(g.game)
+   If g.hasgame
       n = ListItems(g.game.queue)
       For Local i = 0 To n - 1
          If i > 0 Then list$ = list$ .. " | "
@@ -223,7 +228,7 @@ EndFunction
 
 Function p_UpdateTitle()
    Local t$ = #APPNAME
-   If Not IsNil(g.game)
+   If g.hasgame
       t$ = t$ .. " - " .. g.game.name
       If g.dirty Then t$ = t$ .. " *"
    EndIf
@@ -308,6 +313,7 @@ EndFunction
 Function p_OpenGame(gm)
    p_CloseGame(False)
    g.game = gm
+   g.hasgame = True
    g.countdown = gm.interval * 60
    moai.DoMethod("output", "Clear")
    p_UpdateTitle()
@@ -316,7 +322,7 @@ EndFunction
 
 ; returns False if the user cancelled
 Function p_ConfirmDiscard()
-   If IsNil(g.game) Or Not g.dirty Then Return(True)
+   If Not g.hasgame Or Not g.dirty Then Return(True)
    Local r = moai.Request(#APPNAME, "Save changes to \"" .. g.game.name .. "\" first?", "Save|Discard|Cancel")
    If r = 1
       Return(p_DoSave())
@@ -327,7 +333,7 @@ Function p_ConfirmDiscard()
 EndFunction
 
 Function p_DoSave()
-   If IsNil(g.game)
+   If Not g.hasgame
       moai.Request(#APPNAME, "No game is open.", "OK")
       Return(False)
    EndIf
@@ -346,7 +352,8 @@ Function p_CloseGame(ask)
       If Not p_ConfirmDiscard() Then Return(False)
    EndIf
    p_Disconnect()
-   g.game = Nil
+   g.game = {}
+   g.hasgame = False
    g.filename = ""
    g.dirty = False
    p_ClearData()
@@ -359,7 +366,7 @@ EndFunction
 ** Settings window
 ** ------------------------------------------------------------------ */
 Function p_ShowSettings()
-   If IsNil(g.game)
+   If Not g.hasgame
       moai.Request(#APPNAME, "Open or create a game first.", "OK")
       Return
    EndIf
@@ -380,7 +387,7 @@ EndFunction
 
 Function p_ApplySettings()
    Local gm = g.game
-   If IsNil(gm) Then Return(True)
+   If Not g.hasgame Then Return(True)
    Local port = Val(moai.Get("setport", "text"))
    Local interval = Val(moai.Get("setinterval", "text"))
    If port < 1 Or port > 65535
@@ -417,7 +424,7 @@ EndFunction
 Function p_QueueCommand(cmd$)
    cmd$ = p_Trim(cmd$)
    If cmd$ = "" Then Return
-   If IsNil(g.game)
+   If Not g.hasgame
       moai.Request(#APPNAME, "Open or create a game first.", "OK")
       Return
    EndIf
@@ -427,7 +434,7 @@ Function p_QueueCommand(cmd$)
 EndFunction
 
 Function p_ClearQueue()
-   If IsNil(g.game) Then Return
+   If Not g.hasgame Then Return
    g.game.queue = {}
    p_SetDirty(True)
    p_UpdateStatus()
@@ -443,7 +450,7 @@ EndFunction
 ** Login: user <name> / coun <country> / pass <password> / play
 ** ------------------------------------------------------------------ */
 Function p_Poll()
-   If IsNil(g.game)
+   If Not g.hasgame
       moai.Request(#APPNAME, "Open or create a game first.", "OK")
       Return
    EndIf
@@ -475,10 +482,11 @@ Function p_Poll()
    EndIf
 
    g.conn    = id
+   g.connected = True
    g.rxbuf   = ""
    g.lastrx  = g.clock
    g.thought = False
-   g.cur     = Nil
+   g.cur     = False
    g.cmdout  = {}
    p_BuildSession()
 EndFunction
@@ -500,7 +508,7 @@ Function p_BuildSession()
 EndFunction
 
 Function p_Send(s$)
-   If IsNil(g.conn) Then Return
+   If Not g.connected Then Return
    ExitOnError(False)
    GetLastError()
    SendData(g.conn, s$ .. "\n")
@@ -513,21 +521,22 @@ Function p_Send(s$)
 EndFunction
 
 Function p_Disconnect()
-   If Not IsNil(g.conn)
+   If g.connected
       ExitOnError(False)
       CloseConnection(g.conn)
       ExitOnError(True)
-      g.conn = Nil
+      g.conn = 0
+      g.connected = False
       p_Log("Disconnected.")
    EndIf
    g.state = "offline"
    g.session = {}
-   g.cur = Nil
-   If Not IsNil(g.game) Then g.countdown = g.game.interval * 60
+   g.cur = False
+   If g.hasgame Then g.countdown = g.game.interval * 60
    p_UpdateStatus()
 EndFunction
 
-; next session item, Nil when the session is finished. The "queue"
+; next session item, False when the session is finished. The "queue"
 ; marker stays in place until the user queue is empty; queued commands
 ; are removed in p_CommandDone() once the server has answered them.
 Function p_NextItem()
@@ -541,7 +550,7 @@ Function p_NextItem()
          Return(item)
       EndIf
    Wend
-   Return(Nil)
+   Return(False)
 EndFunction
 
 ; send the next command of the session, or log out when done
@@ -549,13 +558,13 @@ Function p_SendNext()
    If g.state <> "ready" Then Return
 
    g.cur = p_NextItem()
-   If IsNil(g.cur) And Not g.thought
+   If GetType(g.cur) <> #TABLE And Not g.thought
       g.thought = True
       p_BotThink()
       g.cur = p_NextItem()
    EndIf
 
-   If IsNil(g.cur)
+   If GetType(g.cur) <> #TABLE
       g.state = "quit"
       p_UpdateStatus()
       p_Send("quit")
@@ -572,8 +581,8 @@ EndFunction
 ; called when the prompt comes back after g.cur
 Function p_CommandDone()
    Local cur = g.cur
-   g.cur = Nil
-   If IsNil(cur) Then Return
+   g.cur = False
+   If GetType(cur) <> #TABLE Then Return
 
    Local w = p_Words(cur.cmd)
    Local verb$ = ""
@@ -586,7 +595,7 @@ Function p_CommandDone()
       p_ParseShips(g.cmdout)
    EndIf
 
-   If cur.src = "queue" And Not IsNil(g.game)
+   If cur.src = "queue" And g.hasgame
       If ListItems(g.game.queue) > 0
          If g.game.queue[0] = cur.cmd Then RemoveItem(g.game.queue, 0)
       EndIf
@@ -687,7 +696,7 @@ Function p_HandleLine(line$)
 EndFunction
 
 Function p_OnNetData(msg)
-   If IsNil(g.conn) Then Return
+   If Not g.connected Then Return
    If msg.ID <> g.conn Then Return
 
    Local chunk$ = ""
@@ -714,12 +723,12 @@ Function p_OnNetData(msg)
       Local line$ = ReplaceStr(LeftStr(g.rxbuf, p), "\r", "")
       g.rxbuf = MidStr(g.rxbuf, p + 1, StrLen(g.rxbuf) - p - 1)
       p_HandleLine(line$)
-      If IsNil(g.conn) Then Break
+      If Not g.connected Then Break
       p = FindStr(g.rxbuf, "\n")
    Wend
    p_FlushOutput()
 
-   If closed And Not IsNil(g.conn)
+   If closed And g.connected
       p_Log("Server closed the connection.")
       p_Disconnect()
       p_RefreshViews()
@@ -773,7 +782,7 @@ Function p_ParseMap(lines)
          Local rlab = StrLen(l$) - StrLen(w[nw - 1])
          If rlab > start Then stop = rlab - 1
          For Local c = start To stop
-            If Not IsNil(hdrx[c])
+            If HaveItem(hdrx, c)
                Local ch$ = MidStr(l$, c, 1)
                If ch$ <> " "
                   Local x = hdrx[c]
@@ -800,16 +809,16 @@ EndFunction
 ; header line (column names) followed by rows of values
 Function p_ParseTable(lines, marker$)
    Local recs = {}
-   Local names = Nil
+   Local names = False
    Local active = False
    For Local i = 0 To ListItems(lines) - 1
       Local l$ = lines[i]
       If p_StartsWith(l$, marker$)
          active = True
-         names = Nil
+         names = False
       ElseIf active
          Local w = p_Words(l$)
-         If IsNil(names)
+         If GetType(names) <> #TABLE
             names = w
          ElseIf ListItems(w) = 0
             ; blank line
@@ -847,7 +856,7 @@ Function p_ParseShips(lines)
    For Local i = 0 To ListItems(g.ships) - 1
       Local s = g.ships[i]
       Local k$ = p_Key(Val(p_F(s, "x")), Val(p_F(s, "y")))
-      If IsNil(g.shipat[k$]) Then g.shipat[k$] = 0
+      If Not HaveItem(g.shipat, k$) Then g.shipat[k$] = 0
       g.shipat[k$] = g.shipat[k$] + 1
    Next
    g.selship = -1
@@ -866,7 +875,7 @@ Function p_BotDo(cmd$)
 EndFunction
 
 Function p_BotThink()
-   If IsNil(g.game) Then Return
+   If Not g.hasgame Then Return
    If Not g.game.warn Then Return
 
    ; Warning: populated sectors with no food will starve at the update
@@ -984,7 +993,7 @@ g.errseen = {}
 Function p_Chk(where$)
    Local err = GetLastError()
    If err <> 0
-      If IsNil(g.errseen[where$])
+      If Not HaveItem(g.errseen, where$)
          g.errseen[where$] = True
          p_Log("ERROR in " .. where$ .. ": " .. GetErrorName(err))
       EndIf
@@ -1050,14 +1059,14 @@ Function p_PaintMap(msg)
       For Local col = c0 To c1
          Local x = g.minx + col
          Local k$ = p_Key(x, y)
-         Local cell = g.map[k$]
-         If Not IsNil(cell)
+         If HaveItem(g.map, k$)
+            Local cell = g.map[k$]
             Local px = #MARGINL + col * #CELLW - msg.ScrollX
-            Local bg, fg = p_CellColors(cell.c, Not IsNil(g.own[k$]))
+            Local bg, fg = p_CellColors(cell.c, HaveItem(g.own, k$))
             Box(px, py, #CELLW - 1, #CELLH - 1, bg)
             SetFontColor(fg)
             TextOut(px + 2, py + 1, cell.c)
-            If Not IsNil(g.shipat[k$]) Then Box(px + #CELLW - 5, py + 1, 3, 3, $40E0FF)
+            If HaveItem(g.shipat, k$) Then Box(px + #CELLW - 5, py + 1, 3, 3, $40E0FF)
             If k$ = selk$
                SetFillStyle(#FILLNONE)
                Box(px - 1, py - 1, #CELLW + 1, #CELLH + 1, $FF4040)
@@ -1207,7 +1216,7 @@ Function p_Tick(msg)
       p_RefreshViews()
    EndIf
 
-   If Not IsNil(g.game)
+   If g.hasgame
       If g.game.autopoll And g.state = "offline"
          g.countdown = g.countdown - 1
          If g.countdown <= 0
